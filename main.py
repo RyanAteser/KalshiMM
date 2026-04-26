@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
-    with open(args.config) as fh:
+    with open(args.config, encoding="utf-8") as fh:
         config = yaml.safe_load(fh)
 
     if args.paper:
