@@ -179,6 +179,8 @@ class KalshiMMClient:
     # Market data
     # ------------------------------------------------------------------
 
+    _logged_raw = False  # class-level flag — dump raw fields once per session
+
     def _get_snapshot(self, ticker: str) -> Optional[dict]:
         """Individual market snapshot with retry on rate-limit."""
         delay = 1.0
@@ -186,6 +188,26 @@ class KalshiMMClient:
             try:
                 resp = self._client.get_market(ticker)
                 market = getattr(resp, "market", resp)
+
+                # One-time raw field dump so we can verify exact field names
+                if not KalshiMMClient._logged_raw:
+                    KalshiMMClient._logged_raw = True
+                    if isinstance(market, dict):
+                        log.info("RAW market keys: %s", sorted(market.keys()))
+                        log.info("RAW market values: %s", {
+                            k: v for k, v in market.items()
+                            if k in ("ticker", "yes_bid", "yes_ask", "last_price",
+                                     "close_time", "close_ts", "volume", "status")
+                        })
+                    else:
+                        attrs = [a for a in dir(market) if not a.startswith("_")]
+                        log.info("RAW market attrs: %s", attrs)
+                        log.info("RAW market sample: %s", {
+                            a: getattr(market, a, None)
+                            for a in ("ticker", "yes_bid", "yes_ask", "last_price",
+                                      "close_time", "close_ts", "volume", "status")
+                        })
+
                 snap = _snapshot_from_raw(market, ticker)
                 return snap
             except Exception as exc:
@@ -241,20 +263,34 @@ class KalshiMMClient:
             if snap is None:
                 continue
 
-            # Filter settled contracts
-            bid, ask = snap.get("yes_bid"), snap.get("yes_ask")
-            if bid is None and ask is None and snap.get("last_price") is None:
-                log.debug("SKIP %s | no price data", ticker)
-                continue
-            if (bid is not None and bid >= _SETTLED_THRESHOLD) or \
-               (ask is not None and ask >= _SETTLED_THRESHOLD):
-                log.debug("SKIP %s | settled (bid=%s ask=%s)", ticker, bid, ask)
+            bid       = snap.get("yes_bid")
+            ask       = snap.get("yes_ask")
+            last      = snap.get("last_price")
+            close_ts  = snap.get("close_ts", 0)
+            log.info(
+                "snap  %-45s bid=%-6s ask=%-6s last=%-6s vol=%-6s tte=%.0fs",
+                ticker,
+                f"{bid:.4f}" if bid is not None else "None",
+                f"{ask:.4f}" if ask is not None else "None",
+                f"{last:.4f}" if last is not None else "None",
+                snap.get("volume"),
+                max(0.0, close_ts - now),
+            )
+
+            # Filter: no price data at all
+            if bid is None and ask is None and last is None:
+                log.info("SKIP %s | no price data", ticker)
                 continue
 
-            # Filter expired
-            close_ts = snap.get("close_ts", 0)
+            # Filter: settled contract
+            if (bid is not None and bid >= _SETTLED_THRESHOLD) or \
+               (ask is not None and ask >= _SETTLED_THRESHOLD):
+                log.info("SKIP %s | settled (bid=%s ask=%s)", ticker, bid, ask)
+                continue
+
+            # Filter: already expired
             if close_ts > 0 and close_ts <= now:
-                log.debug("SKIP %s | expired (close_ts=%d)", ticker, close_ts)
+                log.info("SKIP %s | expired (close_ts=%d now=%d)", ticker, close_ts, int(now))
                 continue
 
             results.append(_snap_to_market_info(snap))
