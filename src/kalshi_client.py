@@ -1,4 +1,16 @@
+"""
+Kalshi API client wrapper — market data and order management.
+
+Market discovery uses the two-step pattern from Kalshi98:
+  1. get_markets()  → list of tickers (no price data in bulk response)
+  2. get_market(ticker) → individual snapshot with bid/ask/last
+Settled (≥0.99) and expired markets are filtered automatically.
+"""
+
+from __future__ import annotations
+
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -7,64 +19,157 @@ from .models import Action, MarketInfo, OrderResult, Side
 
 log = logging.getLogger(__name__)
 
+_SETTLED_THRESHOLD = 0.99
+_MAX_CANDIDATES    = 50
+_SNAP_RETRIES      = 3
 
-def _extract(obj, *fields, default=None):
-    """Pull first matching field from a dict or object."""
-    for f in fields:
-        val = obj.get(f) if isinstance(obj, dict) else getattr(obj, f, None)
+
+# ---------------------------------------------------------------------------
+# Field extraction helpers
+# ---------------------------------------------------------------------------
+
+def _get(obj, *attrs):
+    """Return first non-None value from dict keys or object attributes."""
+    for a in attrs:
+        v = obj.get(a) if isinstance(obj, dict) else getattr(obj, a, None)
+        if v is not None:
+            return v
+    return None
+
+
+def _safe_float(val) -> Optional[float]:
+    """Return float only if strictly in (0, 1); None otherwise."""
+    if val is None:
+        return None
+    try:
+        v = float(val)
+        return v if 0.0 < v < 1.0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_ts(val) -> int:
+    if val is None:
+        return 0
+    try:
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val)
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S+00:00",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    return 0
+
+
+def _get_close_ts(market) -> int:
+    for attr in (
+        "close_ts", "close_time", "close_time_ts", "close_timestamp",
+        "closeTime", "close_time_seconds", "close",
+    ):
+        ts = _parse_ts(_get(market, attr))
+        if ts > 0:
+            return ts
+    return 0
+
+
+def _extract_strike(market) -> float:
+    # 1. Direct numeric fields
+    for attr in ("strike_price", "floor_price", "cap_price", "settlement_value"):
+        val = _get(market, attr)
         if val is not None:
-            return val
-    return default
+            try:
+                v = float(val)
+                if v > 1000:
+                    return v
+            except (TypeError, ValueError):
+                pass
 
+    # 2. Text subtitle — e.g. "$95,000"
+    for attr in ("subtitle", "yes_sub_title", "no_sub_title", "title"):
+        text = _get(market, attr)
+        if text:
+            m = re.search(r'\$?([\d,]+(?:\.\d+)?)', str(text))
+            if m:
+                try:
+                    v = float(m.group(1).replace(",", ""))
+                    if v > 1000:
+                        return v
+                except (TypeError, ValueError):
+                    pass
 
-def _opt_float(val) -> Optional[float]:
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-
-def _to_probability(val) -> Optional[float]:
-    """
-    Normalise a Kalshi price to [0, 1].
-    The API returns prices as integers (1–99 cents); pykalshi may expose
-    them as floats already divided by 100.  Handle both.
-    """
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return f / 100.0 if f > 1.0 else f
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_ts(val) -> float:
-    """
-    Parse a timestamp that may be a unix float, an integer, or an ISO-8601
-    string (e.g. "2025-04-25T18:30:00Z") and return unix epoch seconds.
-    """
-    if val is None:
-        return 0.0
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
+    # 3. Ticker: KXBTC15M-25APR1400-T95000 → 95000
+    ticker = _get(market, "ticker") or ""
+    m = re.search(r'[T-](\d{4,6}(?:\.\d+)?)(?:[^0-9]|$)', str(ticker))
+    if m:
         try:
-            cleaned = val.replace("Z", "+00:00")
-            return datetime.fromisoformat(cleaned).timestamp()
-        except Exception:
+            return float(m.group(1))
+        except (TypeError, ValueError):
             pass
+
     return 0.0
 
 
-class KalshiMMClient:
-    """
-    Thin wrapper around pykalshi that normalises field names across API
-    response shapes and handles retry / paper-trade mode.
-    """
+def _snapshot_from_raw(market, ticker: str) -> Optional[dict]:
+    """Build a normalised snapshot dict from a raw pykalshi market response."""
+    yes_bid = _safe_float(_get(market,
+        "yes_bid_dollars", "yes_bid", "bid", "best_bid_dollars"))
+    yes_ask = _safe_float(_get(market,
+        "yes_ask_dollars", "yes_ask", "ask", "best_ask_dollars"))
+    last_px = _safe_float(_get(market,
+        "last_price_dollars", "last_price", "last", "price_dollars"))
+    volume  = _get(market, "volume_fp", "volume", "total_volume")
+    close_ts = _get_close_ts(market)
 
+    return {
+        "ticker":     ticker,
+        "yes_bid":    yes_bid,
+        "yes_ask":    yes_ask,
+        "last_price": last_px,
+        "volume":     float(volume) if volume is not None else 0.0,
+        "close_ts":   close_ts,
+        "strike":     _extract_strike(market),
+        "no_ask":     round(1.0 - yes_bid, 4) if yes_bid is not None else None,
+        "no_bid":     round(1.0 - yes_ask, 4) if yes_ask is not None else None,
+    }
+
+
+def _snap_to_market_info(snap: dict) -> MarketInfo:
+    yes_bid = snap.get("yes_bid")
+    yes_ask = snap.get("yes_ask")
+    mid = None
+    if yes_bid is not None and yes_ask is not None:
+        mid = (yes_bid + yes_ask) / 2.0
+    elif yes_bid is not None:
+        mid = yes_bid
+    elif yes_ask is not None:
+        mid = yes_ask
+    elif snap.get("last_price") is not None:
+        mid = snap["last_price"]
+
+    return MarketInfo(
+        ticker=snap["ticker"],
+        strike_price=snap.get("strike") or 0.0,
+        close_ts=float(snap.get("close_ts") or 0),
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        last_price=snap.get("last_price"),
+        volume=int(snap.get("volume") or 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+class KalshiMMClient:
     def __init__(self, paper_trade: bool = False):
         from pykalshi import KalshiClient  # type: ignore
         self._client = KalshiClient.from_env()
@@ -74,10 +179,33 @@ class KalshiMMClient:
     # Market data
     # ------------------------------------------------------------------
 
+    def _get_snapshot(self, ticker: str) -> Optional[dict]:
+        """Individual market snapshot with retry on rate-limit."""
+        delay = 1.0
+        for attempt in range(_SNAP_RETRIES):
+            try:
+                resp = self._client.get_market(ticker)
+                market = getattr(resp, "market", resp)
+                snap = _snapshot_from_raw(market, ticker)
+                return snap
+            except Exception as exc:
+                if attempt < _SNAP_RETRIES - 1 and "429" in str(exc):
+                    time.sleep(delay)
+                    delay *= 2
+                elif attempt == _SNAP_RETRIES - 1:
+                    log.warning("snapshot failed [%s]: %s", ticker, exc)
+                    return None
+        return None
+
     def get_markets(self, series: str, limit: int = 200) -> List[MarketInfo]:
+        """
+        Fetch active markets for a series.
+        Uses two-step pattern: list tickers → individual snapshots.
+        Settled (≥0.99) and already-expired contracts are excluded.
+        """
         try:
             try:
-                from pykalshi import MarketStatus  # type: ignore
+                from pykalshi.models import MarketStatus  # type: ignore
                 status_arg = MarketStatus.OPEN
             except ImportError:
                 status_arg = "open"
@@ -87,57 +215,59 @@ class KalshiMMClient:
                 series_ticker=series,
                 limit=limit,
             )
-            raw = _extract(resp, "markets") or []
-
-            # Log one raw market so we can verify field names in production
-            if raw:
-                sample = raw[0]
-                keys = list(sample.keys()) if isinstance(sample, dict) else [
-                    a for a in dir(sample) if not a.startswith("_")
-                ]
-                log.info("market fields (sample): %s", keys)
-
-            results = []
-            for m in raw:
-                ticker = _extract(m, "ticker")
-                if not ticker:
-                    continue
-                results.append(self._parse_market(m, ticker))
-
-            log.info("Fetched %d open %s markets", len(results), series)
-            return results
         except Exception as exc:
-            log.error("get_markets failed: %s", exc, exc_info=True)
+            log.error("get_markets API call failed: %s", exc, exc_info=True)
             return []
 
+        # Normalise response shape
+        if hasattr(resp, "markets"):
+            raw = resp.markets or []
+        elif isinstance(resp, dict):
+            raw = resp.get("markets") or []
+        else:
+            raw = list(resp) if resp else []
+
+        log.info("get_markets returned %d tickers for %s", len(raw), series)
+
+        now = time.time()
+        results: List[MarketInfo] = []
+
+        for m in raw[:_MAX_CANDIDATES]:
+            ticker = _get(m, "ticker")
+            if not ticker:
+                continue
+
+            snap = self._get_snapshot(ticker)
+            if snap is None:
+                continue
+
+            # Filter settled contracts
+            bid, ask = snap.get("yes_bid"), snap.get("yes_ask")
+            if bid is None and ask is None and snap.get("last_price") is None:
+                log.debug("SKIP %s | no price data", ticker)
+                continue
+            if (bid is not None and bid >= _SETTLED_THRESHOLD) or \
+               (ask is not None and ask >= _SETTLED_THRESHOLD):
+                log.debug("SKIP %s | settled (bid=%s ask=%s)", ticker, bid, ask)
+                continue
+
+            # Filter expired
+            close_ts = snap.get("close_ts", 0)
+            if close_ts > 0 and close_ts <= now:
+                log.debug("SKIP %s | expired (close_ts=%d)", ticker, close_ts)
+                continue
+
+            results.append(_snap_to_market_info(snap))
+
+        results.sort(key=lambda m: m.close_ts)
+        log.info("Active %s markets after filtering: %d", series, len(results))
+        return results
+
     def get_market(self, ticker: str) -> Optional[MarketInfo]:
-        try:
-            resp = self._client.get_market(ticker)
-            m = _extract(resp, "market") or resp
-            return self._parse_market(m, ticker)
-        except Exception as exc:
-            log.error("get_market(%s) failed: %s", ticker, exc)
+        snap = self._get_snapshot(ticker)
+        if snap is None:
             return None
-
-    def _parse_market(self, m, ticker: str) -> MarketInfo:
-        """Convert a raw pykalshi market object/dict to MarketInfo."""
-        close_raw = _extract(m, "close_time", "close_ts", "expiration_time",
-                             "expiry_time", "close_date")
-        yes_bid_raw = _extract(m, "yes_bid", "yes_bid_dollars")
-        yes_ask_raw = _extract(m, "yes_ask", "yes_ask_dollars")
-        last_raw    = _extract(m, "last_price", "last_price_dollars")
-        strike_raw  = _extract(m, "strike_price", "floor_strike", "cap_strike", default=0)
-        volume_raw  = _extract(m, "volume", "dollar_volume", default=0)
-
-        return MarketInfo(
-            ticker=ticker,
-            strike_price=float(strike_raw or 0),
-            close_ts=_parse_ts(close_raw),
-            yes_bid=_to_probability(yes_bid_raw),
-            yes_ask=_to_probability(yes_ask_raw),
-            last_price=_to_probability(last_raw),
-            volume=int(float(volume_raw or 0)),
-        )
+        return _snap_to_market_info(snap)
 
     # ------------------------------------------------------------------
     # Order management
@@ -159,13 +289,12 @@ class KalshiMMClient:
                 filled_price=price,
             )
 
-        # Kalshi always takes yes_price_dollars regardless of side.
-        # If we're placing a NO order at no_price, convert: yes_price = 1 - no_price.
+        # Kalshi always takes yes_price_dollars regardless of which side.
         yes_price = round((1.0 - price) if side == Side.NO else price, 4)
 
         from pykalshi._sync.portfolio import Action as KA, Side as KS  # type: ignore
         kalshi_action = KA.BUY if action == Action.BUY else KA.SELL
-        kalshi_side = KS.YES if side == Side.YES else KS.NO
+        kalshi_side   = KS.YES if side == Side.YES else KS.NO
 
         for attempt in range(3):
             try:
@@ -176,9 +305,9 @@ class KalshiMMClient:
                     count_fp=str(count),
                     yes_price_dollars=f"{yes_price:.4f}",
                 )
-                oid = _extract(resp, "order_id", "id")
-                filled = int(_extract(resp, "count_filled", default=0))
-                fp = _opt_float(_extract(resp, "yes_price_dollars", "price"))
+                oid    = _get(resp, "order_id", "id")
+                filled = int(_get(resp, "count_filled") or 0)
+                fp     = _safe_float(_get(resp, "yes_price_dollars", "price"))
                 return OrderResult(
                     success=True,
                     order_id=str(oid),
@@ -214,7 +343,7 @@ class KalshiMMClient:
     def get_balance(self) -> float:
         try:
             resp = self._client.portfolio.get_balance()
-            return float(_extract(resp, "balance_dollars", "balance", default=0))
+            return float(_get(resp, "balance_dollars", "balance") or 0)
         except Exception as exc:
             log.error("get_balance failed: %s", exc)
             return 0.0
@@ -222,14 +351,14 @@ class KalshiMMClient:
     def get_positions(self) -> dict:
         try:
             resp = self._client.portfolio.get_positions()
-            raw = _extract(resp, "positions", "market_positions") or []
+            raw = _get(resp, "positions", "market_positions") or []
             out = {}
             for p in raw:
-                ticker = _extract(p, "ticker")
+                ticker = _get(p, "ticker")
                 if ticker:
                     out[ticker] = {
-                        "yes_count": int(_extract(p, "position", "yes_position", default=0)),
-                        "no_count": int(_extract(p, "no_position", default=0)),
+                        "yes_count": int(_get(p, "position", "yes_position") or 0),
+                        "no_count":  int(_get(p, "no_position") or 0),
                     }
             return out
         except Exception as exc:
