@@ -91,6 +91,7 @@ class MarketMaker:
         )
 
         self._running = False
+        self._stopped = False
         self._cycle = 0
         self._last_balance: float = 0.0
 
@@ -114,6 +115,7 @@ class MarketMaker:
         self._inventory.sync_from_api(positions)
 
         self._running = True
+        self._stopped = False
         try:
             self._loop()
         except KeyboardInterrupt:
@@ -122,6 +124,9 @@ class MarketMaker:
             self.stop()
 
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
         log.info("Shutting down — cancelling all open orders")
         self._running = False
         self._orders.cancel_all()
@@ -184,7 +189,9 @@ class MarketMaker:
         if not self._risk.market_allowed(ticker):
             return
 
-        market = self._bonding.get_market_info(ticker)
+        # Always fetch a fresh snapshot so quotes track live bid/ask movement.
+        # Fall back to bonding-bot cache only if the API call fails.
+        market = self._client.get_market(ticker) or self._bonding.get_market_info(ticker)
         if market is None:
             return
 
