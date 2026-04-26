@@ -1,0 +1,34 @@
+# KalshiMM — Market Maker + Bonding Bot
+# Tune these before going live; run backtest.py --grid first.
+
+paper_trade: true       # Set false to place real orders
+log_level: "INFO"
+
+trading:
+  series: "KXBTC15M"   # BTC 15-minute prediction markets on Kalshi
+  session_duration: 900 # Seconds per contract window (15 min)
+  order_size: 10        # Contracts per resting quote
+  max_position: 50      # Max net YES contracts per market
+  min_time_to_expiry: 300  # Stop quoting < 5 min before expiry
+  loop_interval: 5.0    # Seconds between full quote refreshes
+
+avellaneda_stoikov:
+  gamma: 0.10           # Risk aversion (higher → wider spread, slower inventory build)
+  k: 1.50               # Order-arrival rate (higher → tighter spread)
+  min_spread: 0.02      # Minimum quoted spread (2 cents)
+  max_spread: 0.20      # Maximum quoted spread (20 cents)
+  sigma_window: 100     # BTC price history window for vol estimation
+  sigma_min: 0.005      # Floor on volatility estimate
+  sigma_max: 0.40       # Cap on volatility estimate
+
+bonding:
+  target_markets: 3         # Max concurrent markets to provide liquidity in
+  min_spread_to_bond: 0.04  # Skip markets with spread < 4 cents
+  min_volume: 100           # Skip low-volume markets
+  rebalance_interval: 60    # Seconds between market selection refresh
+
+risk:
+  max_total_position: 200   # Combined YES exposure across all markets
+  max_drawdown: 0.15        # 15% drawdown halts the bot
+  max_loss_per_market: 50   # USD loss per market before pulling quotes
+  daily_loss_limit: 200     # Total session loss limit in USD
