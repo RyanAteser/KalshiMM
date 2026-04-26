@@ -13,13 +13,16 @@ trading:
   loop_interval: 5.0    # Seconds between full quote refreshes
 
 avellaneda_stoikov:
-  gamma: 0.10           # Risk aversion (higher → wider spread, slower inventory build)
-  k: 1.50               # Order-arrival rate (higher → tighter spread)
-  min_spread: 0.02      # Minimum quoted spread (2 cents)
-  max_spread: 0.20      # Maximum quoted spread (20 cents)
+  # k controls base spread: half_spread ≈ (1/gamma)*ln(1+gamma/k)
+  #   k=1.5   → ~65 cents (original, WAY too wide for Kalshi)
+  #   k=100   → ~2 cents  ← correct for 1-cent prediction market ticks
+  gamma: 0.50           # Risk aversion — skews reservation price by ~1¢ per 10 contracts
+  k: 100.0              # High arrival rate → tight ~2-cent base spread
+  min_spread: 0.01      # Hard floor (1 cent)
+  max_spread: 0.06      # Hard ceiling (6 cents — pull back during high vol)
   sigma_window: 100     # BTC price history window for vol estimation
-  sigma_min: 0.005      # Floor on volatility estimate
-  sigma_max: 0.40       # Cap on volatility estimate
+  sigma_min: 0.04       # Floor: 4-cent prob-vol keeps inventory adjustment meaningful
+  sigma_max: 0.30       # Cap on volatility estimate
 
 bonding:
   target_markets: 3         # Max concurrent markets to provide liquidity in

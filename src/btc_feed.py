@@ -63,16 +63,18 @@ class BTCPriceFeed:
         import numpy as np
         prices = self.prices()
         if len(prices) < 3:
-            return 0.02
+            return 0.04  # fallback: 4-cent probability vol
         arr = np.array(prices[-window:], dtype=float)
         log_returns = np.diff(np.log(arr))
         if len(log_returns) == 0:
-            return 0.02
+            return 0.04
         raw_sigma = float(np.std(log_returns))
-        # Scale BTC price vol to YES-probability vol (rough heuristic: /BTC_price * 50000)
-        btc = self._last_price or 50000.0
-        prob_sigma = raw_sigma * (btc / 50000.0) * 0.5
-        return max(0.005, min(0.40, prob_sigma))
+        # Convert BTC tick-level log-return std to probability volatility.
+        # BTC per-tick sigma ≈ 0.0002; near-the-money KXBTC15M delta ≈ 0.35;
+        # probability changes ~20× more per percentage move than raw log-return implies.
+        # Empirical factor of 20 produces sigma_prob ≈ 0.04–0.10 during normal vol.
+        prob_sigma = raw_sigma * 20.0
+        return max(0.02, min(0.40, prob_sigma))
 
     # ------------------------------------------------------------------
     # Internal
