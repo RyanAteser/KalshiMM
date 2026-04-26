@@ -42,8 +42,15 @@ class KalshiMMClient:
 
     def get_markets(self, series: str, limit: int = 200) -> List[MarketInfo]:
         try:
+            # pykalshi expects a MarketStatus enum, not a raw string
+            try:
+                from pykalshi import MarketStatus  # type: ignore
+                status_arg = MarketStatus.OPEN
+            except ImportError:
+                status_arg = "open"
+
             resp = self._client.get_markets(
-                status="open",
+                status=status_arg,
                 series_ticker=series,
                 limit=limit,
             )
