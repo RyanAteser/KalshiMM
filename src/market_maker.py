@@ -1,23 +1,3 @@
-"""
-MarketMaker — the main event loop that ties every component together.
-
-Each tick:
-  1. The BondingBot (re)selects which KXBTC15M markets to quote.
-  2. For each bonded market the A-S engine calculates optimal bid / ask.
-  3. Stale resting quotes are cancelled and fresh ones are posted.
-  4. Risk checks gate every action; a hard halt stops the bot entirely.
-
-Architecture notes
-------------------
-- Single-threaded synchronous loop.  The BTC price feed runs in its own
-  daemon thread (BTCPriceFeed) and communicates via thread-safe shared state.
-- Order lifecycle is cancel-then-replace on every tick.  This is intentionally
-  simple: Kalshi does not have a native amend, and the API latency is low
-  enough that cancel + new order keeps quotes fresh.
-- The inventory manager is the source of truth for positions in-process.
-  It is re-synced from the Kalshi API at startup and every 5 minutes.
-"""
-
 import logging
 import time
 from typing import Optional
@@ -30,12 +10,13 @@ from .kalshi_client import KalshiMMClient
 from .models import Action, Side
 from .order_manager import OrderManager
 from .risk_manager import RiskManager
+from .toxicity import is_toxic
 
 log = logging.getLogger(__name__)
 
-_BALANCE_REFRESH_EVERY = 10    # ticks
-_POSITION_SYNC_EVERY = 60      # ticks  (~5 min at 5s interval)
-_STATUS_LOG_EVERY = 12         # ticks  (~1 min)
+_BALANCE_REFRESH_EVERY = 10
+_POSITION_SYNC_EVERY = 60
+_STATUS_LOG_EVERY = 12
 
 
 class MarketMaker:
@@ -43,14 +24,11 @@ class MarketMaker:
         self._cfg = config
         paper = config.get("paper_trade", False)
 
-        # -- API client --
         self._client = KalshiMMClient(paper_trade=paper)
 
-        # -- BTC price feed --
         as_cfg = config.get("avellaneda_stoikov", {})
         self._btc = BTCPriceFeed(window=as_cfg.get("sigma_window", 100))
 
-        # -- A-S pricing engine --
         self._as = AvellanedaStoikov(ASParams(
             gamma=as_cfg.get("gamma", 0.10),
             k=as_cfg.get("k", 1.50),
@@ -60,7 +38,6 @@ class MarketMaker:
             sigma_max=as_cfg.get("sigma_max", 0.40),
         ))
 
-        # -- Trading params --
         tr = config.get("trading", {})
         self._order_size: int = tr.get("order_size", 10)
         self._max_position: int = tr.get("max_position", 50)
@@ -68,7 +45,6 @@ class MarketMaker:
         self._min_tte: float = tr.get("min_time_to_expiry", 300.0)
         self._session_duration: float = tr.get("session_duration", 900.0)
 
-        # -- Sub-systems --
         risk_cfg = config.get("risk", {})
         self._inventory = InventoryManager(max_position=self._max_position)
         self._risk = RiskManager(
@@ -77,13 +53,14 @@ class MarketMaker:
             max_loss_per_market=risk_cfg.get("max_loss_per_market", 50.0),
             daily_loss_limit=risk_cfg.get("daily_loss_limit", 200.0),
         )
+
         self._orders = OrderManager(self._client)
 
         bond_cfg = config.get("bonding", {})
         self._bonding = BondingBot(
             client=self._client,
             series=tr.get("series", "KXBTC15M"),
-            target_markets=bond_cfg.get("target_markets", 3),
+            target_markets=1,  # 🔥 reduced from 3+
             min_spread=bond_cfg.get("min_spread_to_bond", 0.04),
             min_volume=bond_cfg.get("min_volume", 100),
             min_time_to_expiry=self._min_tte,
@@ -95,17 +72,13 @@ class MarketMaker:
         self._cycle = 0
         self._last_balance: float = 0.0
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # ---------------------- LIFECYCLE ----------------------
 
     def start(self):
-        log.info(
-            "KalshiMM starting | paper=%s  series=%s",
-            self._cfg.get("paper_trade"), self._cfg.get("trading", {}).get("series"),
-        )
+        log.info("Starting Kalshi MM")
+
         self._btc.start()
-        time.sleep(2)  # warm-up the price feed
+        time.sleep(2)
 
         balance = self._client.get_balance()
         self._last_balance = balance
@@ -116,10 +89,9 @@ class MarketMaker:
 
         self._running = True
         self._stopped = False
+
         try:
             self._loop()
-        except KeyboardInterrupt:
-            pass
         finally:
             self.stop()
 
@@ -127,123 +99,182 @@ class MarketMaker:
         if self._stopped:
             return
         self._stopped = True
-        log.info("Shutting down — cancelling all open orders")
+
+        log.info("Stopping bot — cancelling all orders")
         self._running = False
         self._orders.cancel_all()
         self._btc.stop()
         self._print_summary()
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
+    # ---------------------- LOOP ----------------------
 
     def _loop(self):
         while self._running:
             try:
                 self._cycle += 1
                 self._tick()
-            except Exception as exc:
-                log.error("Unhandled error in tick %d: %s", self._cycle, exc, exc_info=True)
+            except Exception as e:
+                log.error("Tick error: %s", e, exc_info=True)
             time.sleep(self._loop_interval)
 
     def _tick(self):
-        # Refresh market selection
         if self._bonding.should_rebalance():
             self._bonding.rebalance()
 
-        # Refresh balance periodically
         if self._cycle % _BALANCE_REFRESH_EVERY == 0:
             self._last_balance = self._client.get_balance()
 
-        # Re-sync positions from API periodically
         if self._cycle % _POSITION_SYNC_EVERY == 0:
             positions = self._client.get_positions()
             self._inventory.sync_from_api(positions)
 
-        # Global risk gate
+        # 🔥 HARD KILL SWITCH
+        if self._inventory.total_realized_pnl() < -50:
+            log.error("KILL SWITCH TRIGGERED (-$50)")
+            self.stop()
+            return
+
         if not self._risk.check(self._last_balance, self._inventory.total_exposure()):
             if self._risk.is_halted():
-                log.error("Risk halt — stopping bot")
                 self.stop()
             return
 
         sigma = self._btc.volatility()
 
         if self._cycle % _STATUS_LOG_EVERY == 0:
-            self._bonding.log_status()
             log.info(
-                "sigma=%.4f  balance=$%.2f  exposure=%d  pnl=$%.4f",
-                sigma, self._last_balance,
-                self._inventory.total_exposure(),
+                "sigma=%.4f balance=%.2f pnl=%.2f exposure=%d",
+                sigma,
+                self._last_balance,
                 self._inventory.total_realized_pnl(),
+                self._inventory.total_exposure(),
             )
 
         for ticker in self._bonding.bonded_markets():
             self._make_market(ticker, sigma)
 
-    # ------------------------------------------------------------------
-    # Per-market quoting
-    # ------------------------------------------------------------------
+    # ---------------------- CORE ----------------------
 
     def _make_market(self, ticker: str, sigma: float):
+        # 🚫 HARD FILTERS
+        if ticker.startswith("KXMVE"):
+            return
+
         if not self._risk.market_allowed(ticker):
             return
 
-        # Always fetch a fresh snapshot so quotes track live bid/ask movement.
-        # Fall back to bonding-bot cache only if the API call fails.
         market = self._client.get_market(ticker) or self._bonding.get_market_info(ticker)
         if market is None:
             return
 
-        mid = market.mid_price
-        if mid is None:
-            log.debug("%s: no mid price, skipping", ticker)
+        # --- Orderbook ---
+        best_bid = getattr(market, "yes_bid", None)
+        best_ask = getattr(market, "yes_ask", None)
+
+        if best_bid is None or best_ask is None:
             return
 
+        # --- Mid anchored to real market ---
+        mid = (best_bid + best_ask) / 2
+
+        # --- Toxic filter ---
+        if hasattr(market, "orderbook") and is_toxic(market.orderbook):
+            return
+
+        # --- Time to expiry ---
         tte = market.time_to_expiry
         if tte < self._min_tte:
-            log.info("%s: expiring in %.0fs — pulling quotes", ticker, tte)
             self._orders.cancel_market_orders(ticker)
             return
 
         net_inv = self._inventory.net_inventory(ticker)
+
+        # ---------------- ALPHA ----------------
+        alpha = 0.0
+        try:
+            prices = self._btc.prices()
+            if prices and len(prices) > 5:
+                alpha = (prices[-1] - prices[-5]) * 0.1
+        except Exception:
+            alpha = 0.0
+
+        # ---------------- QUOTE ----------------
         quote = self._as.quote(
             mid=mid,
             inventory=net_inv,
             sigma=sigma,
             time_remaining=tte,
             session_duration=self._session_duration,
+            alpha=alpha,
         )
+
         if quote is None:
             return
 
-        quote = self._as.skew_for_inventory(quote, net_inv, self._max_position)
+        # ---------------- SPREAD CONTROL ----------------
+        # Stay INSIDE spread (true MM behavior)
+        bid_price = min(quote.bid, best_ask - 0.01)
+        ask_price = max(quote.ask, best_bid + 0.01)
+
+        # Clamp
+        bid_price = max(0.01, min(0.99, bid_price))
+        ask_price = max(0.01, min(0.99, ask_price))
+
+        # 🚫 Prevent crossing (VERY IMPORTANT)
+        if bid_price >= best_ask:
+            return
+
+        # ---------------- EV FILTER ----------------
+        edge = quote.reservation_price - mid
+        spread = ask_price - bid_price
+        ev = edge - spread
+
+        if ev < 0.002:  # slightly relaxed
+            return
 
         log.debug(
-            "%s | mid=%.3f  r=%.3f  bid=%.3f  ask=%.3f  spread=%.3f  inv=%+d  tte=%.0f",
-            ticker, mid, quote.reservation_price,
-            quote.bid, quote.ask, quote.spread,
-            net_inv, tte,
+            "%s | bid=%.3f ask=%.3f mid=%.3f ev=%.4f inv=%d",
+            ticker, bid_price, ask_price, mid, ev, net_inv
         )
 
-        # Cancel stale quotes before placing fresh ones
+        # ---------------- CANCEL OLD ----------------
         self._orders.cancel_market_orders(ticker)
 
-        # Bid: BUY YES at bid price
-        if self._inventory.can_buy_yes(ticker):
-            self._orders.place_quote(
-                ticker=ticker,
-                side=Side.YES,
-                action=Action.BUY,
-                price=quote.bid,
-                count=self._order_size,
-            )
+        # ---------------- INVENTORY LOGIC ----------------
 
-        # Ask: BUY NO at (1 - ask_price)
-        # On Kalshi selling YES = buying NO; quoting NO at (1 - ask) fills when
-        # someone wants to sell NO, which is the same as someone buying YES at ask.
-        if self._inventory.can_buy_no(ticker):
-            no_price = round(1.0 - quote.ask, 4)
+        # NORMAL MM (balanced)
+        if abs(net_inv) < 5:
+            # Buy YES (bid)
+            if self._inventory.can_buy_yes(ticker):
+                self._orders.place_quote(
+                    ticker=ticker,
+                    side=Side.YES,
+                    action=Action.BUY,
+                    price=bid_price,
+                    count=self._order_size,
+                )
+
+            # Sell YES (via NO)
+            if self._inventory.can_buy_no(ticker):
+                no_price = round(1.0 - ask_price, 4)
+
+                if no_price > 0.01:
+                    self._orders.place_quote(
+                        ticker=ticker,
+                        side=Side.NO,
+                        action=Action.BUY,
+                        price=no_price,
+                        count=self._order_size,
+                    )
+
+        # ---------------- FORCE EXIT (THIS FIXES YOUR ISSUE) ----------------
+
+        elif net_inv > 5:
+            # Too long → aggressively sell
+            log.info("%s: reducing long inventory (%d)", ticker, net_inv)
+
+            no_price = round(1.0 - best_ask, 4)
+
             self._orders.place_quote(
                 ticker=ticker,
                 side=Side.NO,
@@ -252,19 +283,32 @@ class MarketMaker:
                 count=self._order_size,
             )
 
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
+        elif net_inv < -5:
+            # Too short → aggressively buy
+            log.info("%s: reducing short inventory (%d)", ticker, net_inv)
+
+            self._orders.place_quote(
+                ticker=ticker,
+                side=Side.YES,
+                action=Action.BUY,
+                price=best_bid,
+                count=self._order_size,
+            )
+    # ---------------------- SUMMARY ----------------------
 
     def _print_summary(self):
-        log.info("==================== Session Summary ====================")
-        log.info("Cycles run      : %d", self._cycle)
-        log.info("Realized PnL    : $%.4f", self._inventory.total_realized_pnl())
-        positions = self._inventory.position_summary()
-        if positions:
-            for ticker, info in positions.items():
-                log.info("  %s  yes=%d  no=%d  net=%+d  pnl=$%.4f",
-                         ticker, info["yes"], info["no"], info["net"], info["realized_pnl"])
-        else:
-            log.info("  (no open positions)")
-        log.info("=========================================================")
+        log.info("====== SESSION SUMMARY ======")
+        log.info("Cycles: %d", self._cycle)
+        log.info("PnL: $%.4f", self._inventory.total_realized_pnl())
+
+        for ticker, info in self._inventory.position_summary().items():
+            log.info(
+                "%s yes=%d no=%d net=%d pnl=%.2f",
+                ticker,
+                info["yes"],
+                info["no"],
+                info["net"],
+                info["realized_pnl"],
+            )
+
+        log.info("=============================")
