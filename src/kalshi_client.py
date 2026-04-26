@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from .models import Action, MarketInfo, OrderResult, Side
@@ -25,6 +26,39 @@ def _opt_float(val) -> Optional[float]:
         return None
 
 
+def _to_probability(val) -> Optional[float]:
+    """
+    Normalise a Kalshi price to [0, 1].
+    The API returns prices as integers (1–99 cents); pykalshi may expose
+    them as floats already divided by 100.  Handle both.
+    """
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return f / 100.0 if f > 1.0 else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_ts(val) -> float:
+    """
+    Parse a timestamp that may be a unix float, an integer, or an ISO-8601
+    string (e.g. "2025-04-25T18:30:00Z") and return unix epoch seconds.
+    """
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            cleaned = val.replace("Z", "+00:00")
+            return datetime.fromisoformat(cleaned).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
 class KalshiMMClient:
     """
     Thin wrapper around pykalshi that normalises field names across API
@@ -42,7 +76,6 @@ class KalshiMMClient:
 
     def get_markets(self, series: str, limit: int = 200) -> List[MarketInfo]:
         try:
-            # pykalshi expects a MarketStatus enum, not a raw string
             try:
                 from pykalshi import MarketStatus  # type: ignore
                 status_arg = MarketStatus.OPEN
@@ -55,41 +88,56 @@ class KalshiMMClient:
                 limit=limit,
             )
             raw = _extract(resp, "markets") or []
+
+            # Log one raw market so we can verify field names in production
+            if raw:
+                sample = raw[0]
+                keys = list(sample.keys()) if isinstance(sample, dict) else [
+                    a for a in dir(sample) if not a.startswith("_")
+                ]
+                log.info("market fields (sample): %s", keys)
+
             results = []
             for m in raw:
                 ticker = _extract(m, "ticker")
                 if not ticker:
                     continue
-                results.append(MarketInfo(
-                    ticker=ticker,
-                    strike_price=float(_extract(m, "strike_price", "floor_strike", default=0)),
-                    close_ts=float(_extract(m, "close_ts", "close_time", default=0)),
-                    yes_bid=_opt_float(_extract(m, "yes_bid_dollars", "yes_bid")),
-                    yes_ask=_opt_float(_extract(m, "yes_ask_dollars", "yes_ask")),
-                    last_price=_opt_float(_extract(m, "last_price_dollars", "last_price")),
-                    volume=int(_extract(m, "volume", default=0)),
-                ))
+                results.append(self._parse_market(m, ticker))
+
+            log.info("Fetched %d open %s markets", len(results), series)
             return results
         except Exception as exc:
-            log.error("get_markets failed: %s", exc)
+            log.error("get_markets failed: %s", exc, exc_info=True)
             return []
 
     def get_market(self, ticker: str) -> Optional[MarketInfo]:
         try:
             resp = self._client.get_market(ticker)
             m = _extract(resp, "market") or resp
-            return MarketInfo(
-                ticker=ticker,
-                strike_price=float(_extract(m, "strike_price", "floor_strike", default=0)),
-                close_ts=float(_extract(m, "close_ts", "close_time", default=0)),
-                yes_bid=_opt_float(_extract(m, "yes_bid_dollars", "yes_bid")),
-                yes_ask=_opt_float(_extract(m, "yes_ask_dollars", "yes_ask")),
-                last_price=_opt_float(_extract(m, "last_price_dollars", "last_price")),
-                volume=int(_extract(m, "volume", default=0)),
-            )
+            return self._parse_market(m, ticker)
         except Exception as exc:
             log.error("get_market(%s) failed: %s", ticker, exc)
             return None
+
+    def _parse_market(self, m, ticker: str) -> MarketInfo:
+        """Convert a raw pykalshi market object/dict to MarketInfo."""
+        close_raw = _extract(m, "close_time", "close_ts", "expiration_time",
+                             "expiry_time", "close_date")
+        yes_bid_raw = _extract(m, "yes_bid", "yes_bid_dollars")
+        yes_ask_raw = _extract(m, "yes_ask", "yes_ask_dollars")
+        last_raw    = _extract(m, "last_price", "last_price_dollars")
+        strike_raw  = _extract(m, "strike_price", "floor_strike", "cap_strike", default=0)
+        volume_raw  = _extract(m, "volume", "dollar_volume", default=0)
+
+        return MarketInfo(
+            ticker=ticker,
+            strike_price=float(strike_raw or 0),
+            close_ts=_parse_ts(close_raw),
+            yes_bid=_to_probability(yes_bid_raw),
+            yes_ask=_to_probability(yes_ask_raw),
+            last_price=_to_probability(last_raw),
+            volume=int(float(volume_raw or 0)),
+        )
 
     # ------------------------------------------------------------------
     # Order management

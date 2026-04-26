@@ -116,16 +116,34 @@ class BondingBot:
     def _filter(self, markets: List[MarketInfo]) -> List[MarketInfo]:
         out = []
         for m in markets:
-            if m.time_to_expiry < self._min_tte:
+            tte = m.time_to_expiry
+            if tte < self._min_tte:
+                log.debug("SKIP %s | tte=%.0fs < min=%.0fs", m.ticker, tte, self._min_tte)
                 continue
             if m.volume < self._min_volume:
+                log.debug("SKIP %s | volume=%d < min=%d", m.ticker, m.volume, self._min_volume)
                 continue
             if m.spread is None or m.spread < self._min_spread:
+                log.debug("SKIP %s | spread=%s < min=%.3f", m.ticker, m.spread, self._min_spread)
                 continue
             if m.mid_price is None:
+                log.debug("SKIP %s | no mid price", m.ticker)
                 continue
             out.append(m)
-        log.debug("%d / %d markets pass bonding filters", len(out), len(markets))
+
+        log.info(
+            "Bonding filter: %d / %d pass  (min_tte=%.0f  min_vol=%d  min_spread=%.3f)",
+            len(out), len(markets), self._min_tte, self._min_volume, self._min_spread,
+        )
+        # If nothing passes, log a summary of all markets to help tune thresholds
+        if not out and markets:
+            for m in markets[:5]:
+                log.info(
+                    "  candidate: %s | tte=%.0fs  vol=%d  spread=%s  mid=%s",
+                    m.ticker, m.time_to_expiry, m.volume,
+                    f"{m.spread:.3f}" if m.spread is not None else "None",
+                    f"{m.mid_price:.3f}" if m.mid_price is not None else "None",
+                )
         return out
 
     def _rank(self, markets: List[MarketInfo]) -> List[MarketInfo]:
