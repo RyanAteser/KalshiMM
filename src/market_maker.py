@@ -201,8 +201,30 @@ class MarketMaker:
             return
 
         tte = market.time_to_expiry
+
+        # Near-expiry regime: digital gamma explodes as 1/tau.
+        # Pull all quotes in final 10s. Flatten-only in last 30s.
+        # Widen spread 2x in last 2 min to compensate for rising gamma.
+        if tte <= 10:
+            log.info("%s: tte=%.0fs — pulling all quotes", ticker, tte)
+            self._orders.cancel_market_orders(ticker)
+            return
         if tte < self._min_tte:
-            log.info("%s: expiring in %.0fs — pulling quotes", ticker, tte)
+            log.info("%s: tte=%.0fs — below min_tte, pulling quotes", ticker, tte)
+            self._orders.cancel_market_orders(ticker)
+            return
+
+        # Spread multiplier increases as expiry approaches
+        if tte < 120:
+            spread_mult = 3.0
+        elif tte < 300:
+            spread_mult = 2.0
+        else:
+            spread_mult = 1.0
+
+        # BTC feed staleness check — pull quotes if feed is >30s stale
+        if self._btc.is_stale(max_age=30.0):
+            log.warning("%s: BTC feed stale — pulling quotes", ticker)
             self._orders.cancel_market_orders(ticker)
             return
 
@@ -210,7 +232,7 @@ class MarketMaker:
         quote = self._as.quote(
             mid=mid,
             inventory=net_inv,
-            sigma=sigma,
+            sigma=sigma * spread_mult,   # widen near expiry via effective sigma
             time_remaining=tte,
             session_duration=self._session_duration,
         )
@@ -219,11 +241,9 @@ class MarketMaker:
 
         quote = self._as.skew_for_inventory(quote, net_inv, self._max_position)
 
-        log.debug(
-            "%s | mid=%.3f  r=%.3f  bid=%.3f  ask=%.3f  spread=%.3f  inv=%+d  tte=%.0f",
-            ticker, mid, quote.reservation_price,
-            quote.bid, quote.ask, quote.spread,
-            net_inv, tte,
+        log.info(
+            "%s | mid=%.2f  bid=%.2f  ask=%.2f  spread=%.2f  inv=%+d  tte=%.0fs  mult=%.0fx",
+            ticker, mid, quote.bid, quote.ask, quote.spread, net_inv, tte, spread_mult,
         )
 
         # Cancel stale quotes before placing fresh ones
@@ -240,10 +260,10 @@ class MarketMaker:
             )
 
         # Ask: BUY NO at (1 - ask_price)
-        # On Kalshi selling YES = buying NO; quoting NO at (1 - ask) fills when
-        # someone wants to sell NO, which is the same as someone buying YES at ask.
+        # Selling YES = buying NO on Kalshi; quoting NO at (1 - ask) fills when
+        # someone buys YES at ask price.
         if self._inventory.can_buy_no(ticker):
-            no_price = round(1.0 - quote.ask, 4)
+            no_price = round(1.0 - quote.ask, 2)
             self._orders.place_quote(
                 ticker=ticker,
                 side=Side.NO,

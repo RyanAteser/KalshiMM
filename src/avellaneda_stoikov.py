@@ -99,12 +99,21 @@ class AvellanedaStoikov:
         if ask - bid < self.p.min_spread:
             centre = (bid + ask) / 2.0
             half = self.p.min_spread / 2.0
-            bid = round(max(_PRICE_MIN, centre - half), 4)
-            ask = round(min(_PRICE_MAX, centre + half), 4)
+            bid = max(_PRICE_MIN, centre - half)
+            ask = min(_PRICE_MAX, centre + half)
+
+        # Kalshi requires whole-cent prices (1-99 cents).
+        # Round to 2 decimal places so we never send 0.0999 or 0.1201.
+        bid = round(bid, 2)
+        ask = round(ask, 2)
+
+        # Final spread guard after rounding
+        if ask <= bid:
+            ask = round(bid + 0.01, 2)
 
         return ASQuote(
-            reservation_price=round(r, 4),
-            spread=round(ask - bid, 4),
+            reservation_price=round(r, 2),
+            spread=round(ask - bid, 2),
             bid=bid,
             ask=ask,
             inventory_adjustment=round(inventory_adj, 4),
@@ -125,12 +134,12 @@ class AvellanedaStoikov:
 
         if inventory > 0:
             # Overlong YES: push both legs down to sell YES / buy NO
-            new_bid = round(quote.bid - extra, 4)
-            new_ask = round(quote.ask - extra * 0.5, 4)
+            new_bid = round(quote.bid - extra, 2)
+            new_ask = round(quote.ask - extra * 0.5, 2)
         else:
             # Overlong NO: push both legs up to sell NO / buy YES
-            new_bid = round(quote.bid + extra * 0.5, 4)
-            new_ask = round(quote.ask + extra, 4)
+            new_bid = round(quote.bid + extra * 0.5, 2)
+            new_ask = round(quote.ask + extra, 2)
 
         new_bid = max(_PRICE_MIN, min(new_bid, new_ask - self.p.min_spread))
         new_ask = min(_PRICE_MAX, max(new_ask, new_bid + self.p.min_spread))

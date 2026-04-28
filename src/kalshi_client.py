@@ -326,11 +326,20 @@ class KalshiMMClient:
             )
 
         # Kalshi always takes yes_price_dollars regardless of which side.
-        yes_price = round((1.0 - price) if side == Side.NO else price, 4)
+        # Must be a whole cent: 0.10, 0.11, ..., 0.99 — round strictly to 2dp.
+        raw_price = (1.0 - price) if side == Side.NO else price
+        yes_price = round(raw_price, 2)
+
+        # Sanity guard: must be a valid cent in (0, 1)
+        if not (0.01 <= yes_price <= 0.99):
+            return OrderResult(success=False, error=f"yes_price {yes_price} out of range")
 
         from pykalshi._sync.portfolio import Action as KA, Side as KS  # type: ignore
         kalshi_action = KA.BUY if action == Action.BUY else KA.SELL
         kalshi_side   = KS.YES if side == Side.YES else KS.NO
+
+        _FATAL = ("insufficient_balance", "market_closed", "invalid_price",
+                  "invalid_order", "bad_request")
 
         for attempt in range(3):
             try:
@@ -339,7 +348,7 @@ class KalshiMMClient:
                     action=kalshi_action,
                     side=kalshi_side,
                     count_fp=str(count),
-                    yes_price_dollars=f"{yes_price:.4f}",
+                    yes_price_dollars=f"{yes_price:.2f}",
                 )
                 oid    = _get(resp, "order_id", "id")
                 filled = int(_get(resp, "count_filled") or 0)
@@ -352,7 +361,8 @@ class KalshiMMClient:
                 )
             except Exception as exc:
                 msg = str(exc)
-                if any(x in msg for x in ("insufficient_balance", "market_closed")):
+                if any(x in msg for x in _FATAL):
+                    log.warning("place_order non-retryable: %s", msg)
                     return OrderResult(success=False, error=msg)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
