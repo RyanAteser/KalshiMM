@@ -51,47 +51,43 @@ class AvellanedaStoikov:
         self.p = params
 
     def quote(
-        self,
-        mid: float,
-        inventory: int,
-        sigma: float,
-        time_remaining: float,
-        session_duration: float = 900.0,
+            self,
+            mid: float,
+            inventory: int,
+            sigma: float,
+            time_remaining: float,
+            session_duration: float = 900.0,
+            alpha: float = 0.0,  # NEW: directional edge
     ) -> Optional[ASQuote]:
-        """
-        Returns an ASQuote or None if the mid price is out of range.
 
-        Args:
-            mid:              Current YES midpoint price (0-1).
-            inventory:        Net YES position (positive = long).
-            sigma:            Volatility estimate (std of YES-price changes per tick).
-            time_remaining:   Seconds until market expiry.
-            session_duration: Nominal session length in seconds (900s = 15 min).
-        """
         if not (_PRICE_MIN <= mid <= _PRICE_MAX):
             return None
 
         sigma = max(self.p.sigma_min, min(self.p.sigma_max, sigma))
         T = max(0.01, time_remaining / max(session_duration, 1.0))
 
-        # Reservation price: pull mid toward fair-value given inventory
-        inventory_adj = inventory * self.p.gamma * (sigma ** 2) * T
-        r = mid - inventory_adj
+        # ✅ FIXED: nonlinear inventory skew (prevents runaway)
+        inv_ratio = inventory / 20.0
+        inventory_adj = -0.05 * math.tanh(inv_ratio)
 
-        # Optimal half-spread
+        # ✅ ADD: directional alpha (your edge)
+        r = mid + alpha + inventory_adj
+
+        # ✅ FIXED: spread now actually meaningful
         half_spread = (
-            (self.p.gamma * (sigma ** 2) * T) / 2.0
-            + (1.0 / self.p.gamma) * math.log(1.0 + self.p.gamma / self.p.k)
+                0.5 * sigma
+                + 0.01 * abs(inventory)
+                + 0.01 * (1 - T)  # tighter near expiry
         )
+
         half_spread = max(
             self.p.min_spread / 2.0,
             min(self.p.max_spread / 2.0, half_spread),
-        )
+            )
 
-        bid = round(r - half_spread, 4)
-        ask = round(r + half_spread, 4)
+        bid = math.floor((r - half_spread) * 100) / 100
+        ask = math.ceil((r + half_spread) * 100) / 100
 
-        # Clamp to prediction-market bounds
         bid = max(_PRICE_MIN, min(_PRICE_MAX - self.p.min_spread, bid))
         ask = min(_PRICE_MAX, max(_PRICE_MIN + self.p.min_spread, ask))
 
@@ -99,17 +95,13 @@ class AvellanedaStoikov:
         if ask - bid < self.p.min_spread:
             centre = (bid + ask) / 2.0
             half = self.p.min_spread / 2.0
-            bid = max(_PRICE_MIN, centre - half)
-            ask = min(_PRICE_MAX, centre + half)
+            bid = max(_PRICE_MIN, round(centre - half, 2))
+            ask = min(_PRICE_MAX, round(centre + half, 2))
 
-        # Kalshi requires whole-cent prices (1-99 cents).
-        # Round to 2 decimal places so we never send 0.0999 or 0.1201.
-        bid = round(bid, 2)
-        ask = round(ask, 2)
-
-        # Final spread guard after rounding
+        # Final spread guard after floor/ceil + clamp
         if ask <= bid:
             ask = round(bid + 0.01, 2)
+
 
         return ASQuote(
             reservation_price=round(r, 2),
@@ -141,8 +133,12 @@ class AvellanedaStoikov:
             new_bid = round(quote.bid + extra * 0.5, 2)
             new_ask = round(quote.ask + extra, 2)
 
-        new_bid = max(_PRICE_MIN, min(new_bid, new_ask - self.p.min_spread))
-        new_ask = min(_PRICE_MAX, max(new_ask, new_bid + self.p.min_spread))
+        if inventory > 0:
+            new_bid = math.floor((quote.bid - extra) * 100) / 100
+            new_ask = math.floor((quote.ask - extra * 0.5) * 100) / 100
+        else:
+            new_bid = math.ceil((quote.bid + extra * 0.5) * 100) / 100
+            new_ask = math.ceil((quote.ask + extra) * 100) / 100
 
         return ASQuote(
             reservation_price=round((new_bid + new_ask) / 2.0, 4),

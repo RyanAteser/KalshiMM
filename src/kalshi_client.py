@@ -326,13 +326,10 @@ class KalshiMMClient:
             )
 
         # Kalshi always takes yes_price_dollars regardless of which side.
-        # Must be a whole cent: 0.10, 0.11, ..., 0.99 — round strictly to 2dp.
-        raw_price = (1.0 - price) if side == Side.NO else price
-        yes_price = round(raw_price, 2)
-
-        # Sanity guard: must be a valid cent in (0, 1)
-        if not (0.01 <= yes_price <= 0.99):
-            return OrderResult(success=False, error=f"yes_price {yes_price} out of range")
+        # Kalshi only accepts 1-cent increments; quantize defensively.
+        yes_price = (1.0 - price) if side == Side.NO else price
+        yes_price = round(yes_price * 100) / 100
+        yes_price = max(0.01, min(0.99, yes_price))
 
         from pykalshi._sync.portfolio import Action as KA, Side as KS  # type: ignore
         kalshi_action = KA.BUY if action == Action.BUY else KA.SELL

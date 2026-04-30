@@ -1,13 +1,13 @@
 # KalshiMM — Market Maker + Bonding Bot
 # Tune these before going live; run backtest.py --grid first.
 
-paper_trade: true       # Set false to place real orders
+paper_trade: false       # Set false to place real orders
 log_level: "INFO"
 
 trading:
   series: "KXBTC15M"   # BTC 15-minute prediction markets on Kalshi
   session_duration: 900 # Seconds per contract window (15 min)
-  order_size: 10        # Contracts per resting quote
+  order_size: 1        # Contracts per resting quote
   max_position: 50      # Max net YES contracts per market
   min_time_to_expiry: 120  # Stop quoting < 2 min before expiry
   loop_interval: 5.0    # Seconds between full quote refreshes
