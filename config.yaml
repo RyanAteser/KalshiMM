@@ -35,3 +35,27 @@ risk:
   max_drawdown: 0.15        # 15% drawdown halts the bot
   max_loss_per_market: 50   # USD loss per market before pulling quotes
   daily_loss_limit: 200     # Total session loss limit in USD
+
+# ── Kalshi KXBTC15M Mean Reversion Bot ───────────────────────────────────────
+# Validate:  python mean_reversion_backtest.py
+# Paper:     python mean_reversion_main.py --paper
+# Live:      python mean_reversion_main.py   (needs Kalshi creds in .env)
+
+mean_reversion:
+  # Capital and sizing
+  initial_capital: 1000.0    # Starting USD capital for the mean reversion bot
+  position_size_pct: 0.02    # 2% of capital per trade (Kelly-conservative)
+
+  # Edge gate — OOS bucket mean must clear this to enable trading.
+  # Set ≥ 0.002 (0.2%). Raise if you want a stricter quality bar.
+  min_edge: 0.002
+
+  # Spread + gas cost per round-trip (log-return units).
+  # Polymarket typical: 1-2c spread + ~$0.05 gas = ~1.5% on a $100 trade.
+  # Expressed as log-return: log(1.015) ≈ 0.015.
+  spread_cost: 0.015
+
+  # Validation parameters
+  min_bars: 200              # Minimum bars for robust bucket analysis
+  history_days: 90           # Days of history to pull on (re)calibration
+  recalibrate_days: 7        # Re-run validation every N days (weekly)

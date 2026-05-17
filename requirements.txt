@@ -3,3 +3,8 @@ python-dotenv>=1.2.2
 pyyaml>=6.0
 numpy>=1.24.0
 websockets>=11.0
+requests>=2.31.0
+# py-clob-client is optional: only needed for live Polymarket order placement.
+# Install with: pip install py-clob-client
+# Leave commented out for paper-trade / backtest-only usage.
+# py-clob-client>=0.19.0
