@@ -36,16 +36,21 @@ def _logit(p: float) -> float:
 
 def log_return(p_prev: float, p_curr: float) -> float:
     """
-    Log return between two probability prices.
-    Uses logit transform when either price is in the extreme zone
-    (< EXTREME_LO or > EXTREME_HI) to keep returns finite and symmetric.
+    Log return between two consecutive bar closes.
+
+    For probability prices (0 < p ≤ 1):
+      - Normal range [EXTREME_LO, EXTREME_HI]: plain log return.
+      - Extreme zone: logit-transformed return to avoid boundary blow-up.
+
+    For asset prices (p > 1, e.g. BTC at $95,000):
+      - Always plain log return; the logit path is skipped automatically.
     """
     if p_prev <= 0.0 or p_curr <= 0.0:
         return 0.0
-    if p_prev >= 1.0 or p_curr >= 1.0:
-        return 0.0
-    if min(p_prev, p_curr) < EXTREME_LO or max(p_prev, p_curr) > EXTREME_HI:
-        return _logit(p_curr) - _logit(p_prev)
+    # Logit transform only makes sense for probability prices in (0, 1)
+    if p_prev <= 1.0 and p_curr <= 1.0:
+        if min(p_prev, p_curr) < EXTREME_LO or max(p_prev, p_curr) > EXTREME_HI:
+            return _logit(p_curr) - _logit(p_prev)
     return math.log(p_curr / p_prev)
 
 
