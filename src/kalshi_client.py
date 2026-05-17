@@ -171,9 +171,16 @@ def _snap_to_market_info(snap: dict) -> MarketInfo:
 
 class KalshiMMClient:
     def __init__(self, paper_trade: bool = False):
-        from pykalshi import KalshiClient  # type: ignore
-        self._client = KalshiClient.from_env()
         self._paper = paper_trade
+        self._client = None
+        try:
+            from pykalshi import KalshiClient  # type: ignore
+            self._client = KalshiClient.from_env()
+        except Exception as exc:
+            if paper_trade:
+                log.warning("No Kalshi credentials — paper mode running with mock market data (%s)", exc)
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # Market data
@@ -183,6 +190,8 @@ class KalshiMMClient:
 
     def _get_snapshot(self, ticker: str) -> Optional[dict]:
         """Individual market snapshot with retry on rate-limit."""
+        if self._client is None:
+            return None
         delay = 1.0
         for attempt in range(_SNAP_RETRIES):
             try:
@@ -224,7 +233,10 @@ class KalshiMMClient:
         Fetch active markets for a series.
         Uses two-step pattern: list tickers → individual snapshots.
         Settled (≥0.99) and already-expired contracts are excluded.
+        Returns [] when running in credential-free paper mode.
         """
+        if self._client is None:
+            return []
         try:
             try:
                 from pykalshi.models import MarketStatus  # type: ignore
@@ -384,6 +396,8 @@ class KalshiMMClient:
     # ------------------------------------------------------------------
 
     def get_balance(self) -> float:
+        if self._client is None:
+            return 0.0
         try:
             resp = self._client.portfolio.get_balance()
             return float(_get(resp, "balance_dollars", "balance") or 0)
@@ -392,6 +406,8 @@ class KalshiMMClient:
             return 0.0
 
     def get_positions(self) -> dict:
+        if self._client is None:
+            return {}
         try:
             resp = self._client.portfolio.get_positions()
             raw = _get(resp, "positions", "market_positions") or []

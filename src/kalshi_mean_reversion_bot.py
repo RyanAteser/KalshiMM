@@ -357,6 +357,19 @@ class KalshiMeanReversionBot:
             if m.mid_price is not None and m.time_to_expiry > self._min_tte
         ]
         if not candidates:
+            # Credential-free paper mode: no live markets available — return a
+            # synthetic near-the-money stub so signal + order logging still runs.
+            if self._client._paper and self._client._client is None:
+                mock = MarketInfo(
+                    ticker=f"{self._series}-PAPER-MOCK",
+                    strike_price=0.0,
+                    close_ts=time.time() + _BAR_SECONDS,
+                    yes_bid=0.49,
+                    yes_ask=0.51,
+                    last_price=0.50,
+                )
+                log.info("Paper mode (no creds): using mock market %s", mock.ticker)
+                return mock
             log.warning(
                 "No %s markets with tte>%.0fs and a mid price",
                 self._series, self._min_tte,
