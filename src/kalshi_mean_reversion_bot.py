@@ -25,9 +25,10 @@ per 15-min bar, sized at `order_size` contracts from config.
 
 Calibration
 -----------
-On startup and then weekly: pulls 90 days of BTC/USDT 15-min OHLC from
-Binance (free, no auth) and runs the full MeanReversionValidator pipeline.
-Trading is enabled only when both OOS bucket means clear `min_edge`.
+On startup and then weekly: pulls 90 days of BTC/USD 15-min OHLC from
+Kraken (primary, no auth) with automatic fallback to CryptoCompare, then
+runs the full MeanReversionValidator pipeline. Trading is enabled only when
+both OOS bucket means clear `min_edge`.
 """
 
 from __future__ import annotations
@@ -55,66 +56,161 @@ _DEFAULT_MIN_TTE   = 300            # skip markets with < 5 min to expiry
 
 
 # ---------------------------------------------------------------------------
-# Binance BTC OHLC helper (calibration only — no auth required)
+# BTC OHLC helpers (calibration only — no auth required)
+#
+# Primary:  Kraken — most relevant because Kalshi KXBTC15M settlement uses
+#           a Kraken-based BTC index price.  Paginates via 'since'; returns
+#           up to 720 bars per call (720 × 15 min = 7.5 days → ~12 calls).
+#
+# Fallback: CryptoCompare — cross-exchange aggregated BTC/USD price.
+#           Paginates backward via 'toTs'; returns 2000 × 15-min bars per
+#           call (~20 days → ~5 calls for 90 days).
 # ---------------------------------------------------------------------------
 
 def fetch_btc_15min_bars(days: int = 90) -> List[Bar]:
     """
-    Pull BTC/USDT 15-min OHLC from Binance public REST API.
-    Paginates automatically (1,000 bars per request).
-    Returns bars sorted chronologically.
+    Fetch BTC/USD 15-min OHLC bars.  Tries Kraken first; falls back to
+    CryptoCompare if Kraken is unreachable (e.g. some cloud environments
+    block exchange IPs).  Returns bars sorted chronologically.
     """
-    end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - days * 86_400 * 1000
-    url      = "https://api.binance.com/api/v3/klines"
-    bars: List[Bar] = []
-    cursor = start_ms
+    bars = _fetch_kraken(days)
+    if len(bars) >= 100:
+        return bars
+    log.warning("Kraken returned %d bars — falling back to CryptoCompare", len(bars))
+    return _fetch_cryptocompare(days)
 
-    while cursor < end_ms:
+
+def _fetch_kraken(days: int) -> List[Bar]:
+    """
+    Kraken public OHLC endpoint.
+    Row format: [time, open, high, low, close, vwap, volume, count]
+    Rate limit: ~1 public req/s.
+    """
+    end_ts   = int(time.time())
+    start_ts = end_ts - days * 86_400
+    url      = "https://api.kraken.com/0/public/OHLC"
+    bars: List[Bar] = []
+    since = start_ts
+
+    while since < end_ts:
+        try:
+            resp = requests.get(
+                url,
+                params={"pair": "XBTUSD", "interval": 15, "since": since},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("Kraken request failed: %s", exc)
+            break
+
+        if data.get("error"):
+            log.warning("Kraken API error: %s", data["error"])
+            break
+
+        result   = data.get("result", {})
+        pair_key = next((k for k in result if k != "last"), None)
+        if not pair_key:
+            break
+
+        candles = result[pair_key]
+        if not candles:
+            break
+
+        for row in candles:
+            try:
+                open_ts = int(row[0])
+                if open_ts < start_ts:
+                    continue
+                bars.append(Bar(
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[6]),
+                    bar_start_ts=open_ts,
+                    bar_end_ts=open_ts + 900,
+                ))
+            except Exception:
+                pass
+
+        last = result.get("last")
+        if not last or int(last) <= since:
+            break
+        since = int(last)
+        time.sleep(0.5)
+
+    bars.sort(key=lambda b: b.bar_start_ts)
+    log.info("Kraken: %d BTC/USD 15-min bars (%d days)", len(bars), days)
+    return bars
+
+
+def _fetch_cryptocompare(days: int) -> List[Bar]:
+    """
+    CryptoCompare histominute endpoint with aggregate=15.
+    Each call returns up to 2000 fifteen-minute bars (~20.8 days).
+    Paginates backward by decrementing 'toTs'.
+    No API key required for the free tier.
+    """
+    end_ts   = int(time.time())
+    start_ts = end_ts - days * 86_400
+    url      = "https://min-api.cryptocompare.com/data/v2/histominute"
+    bars: List[Bar] = []
+    to_ts = end_ts
+
+    while to_ts > start_ts:
         try:
             resp = requests.get(
                 url,
                 params={
-                    "symbol":    "BTCUSDT",
-                    "interval":  "15m",
-                    "startTime": cursor,
-                    "endTime":   end_ms,
-                    "limit":     1000,
+                    "fsym":      "BTC",
+                    "tsym":      "USD",
+                    "limit":     2000,
+                    "aggregate": 15,
+                    "toTs":      to_ts,
                 },
                 timeout=15,
             )
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            log.error("Binance klines fetch failed: %s", exc)
+            log.error("CryptoCompare request failed: %s", exc)
             break
 
-        if not data:
+        if data.get("Response") != "Success":
+            log.error("CryptoCompare error: %s", data.get("Message"))
             break
 
-        for row in data:
-            # Binance kline: [open_ms, open, high, low, close, vol, close_ms, ...]
+        candles = data["Data"]["Data"]
+        if not candles:
+            break
+
+        for row in candles:
             try:
+                ts = int(row["time"])
+                if ts < start_ts:
+                    continue
                 bars.append(Bar(
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=float(row[5]),
-                    bar_start_ts=int(row[0]) // 1000,
-                    bar_end_ts=int(row[6]) // 1000,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row.get("volumefrom", 0)),
+                    bar_start_ts=ts,
+                    bar_end_ts=ts + 900,
                 ))
             except Exception:
                 pass
 
-        last_close_ms = int(data[-1][6])
-        if last_close_ms >= end_ms:
+        oldest_ts = int(candles[0]["time"])
+        if oldest_ts <= start_ts:
             break
-        cursor = last_close_ms + 1
-        time.sleep(0.15)   # respect rate limit
+        to_ts = oldest_ts - 1
+        time.sleep(0.3)
 
     bars.sort(key=lambda b: b.bar_start_ts)
-    log.info("Binance: fetched %d BTC/USDT 15-min bars (%d days)", len(bars), days)
+    log.info("CryptoCompare: %d BTC/USD 15-min bars (%d days)", len(bars), days)
     return bars
 
 
@@ -350,7 +446,7 @@ class KalshiMeanReversionBot:
         self._validation = self._validator.validate(bars)
         self._last_cal   = time.time()
 
-        # Seed the live bar builder so lag-1 is ready at the first tick
+        # Seed the live bar builder with recent bars so lag-1 is ready at the first tick
         self._builder.load_historical(bars[-10:])
 
         log.info(

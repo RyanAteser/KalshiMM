@@ -4,9 +4,9 @@ Kalshi KXBTC15M Mean Reversion — Validation & Backtest Script.
 
 Runs the full 8-step pipeline from the HFT article on BTC price data:
 
-  Step 1  Fetch 90 days of BTC/USDT 15-min OHLC from Binance (free, no auth).
-          BTC log returns are a reliable proxy for near-the-money KXBTC15M
-          YES price movements (delta ≈ 0.5 near the money).
+  Step 1  Fetch 90 days of BTC/USD 15-min OHLC from Kraken (primary, free,
+          no auth), falling back to CryptoCompare if Kraken is unreachable.
+          BTC log returns proxy near-the-money KXBTC15M YES price movements.
   Step 2  Convert BTC closes to log returns.
   Step 3  Add lag-1 (previous bar's log return).
   Step 4  Encode direction as +1 / -1.
@@ -84,7 +84,7 @@ def _equity_curve(trade_returns: np.ndarray, width: int = 60, height: int = 12):
 def run_backtest(days: int = 90, min_edge: float = 0.002):
     _hr()
     print("KXBTC15M MEAN REVERSION — VALIDATION PIPELINE")
-    print(f"  Source : Binance BTC/USDT 15-min OHLC")
+    print(f"  Source : Kraken BTC/USD (fallback: CryptoCompare)")
     print(f"  Window : {days} days  |  Min OOS edge : {min_edge:.4f}")
     _hr()
 
