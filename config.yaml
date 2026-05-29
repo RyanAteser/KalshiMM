@@ -36,6 +36,28 @@ risk:
   max_loss_per_market: 50   # USD loss per market before pulling quotes
   daily_loss_limit: 200     # Total session loss limit in USD
 
+# ── Kalshi Weather Arbitrage Bot ─────────────────────────────────────────────
+# Run:   python weather_main.py --paper   (paper trade)
+#        python weather_main.py           (live, needs Kalshi creds in .env)
+
+weather:
+  # Kalshi weather market series tickers — find these on kalshi.com/markets/weather
+  # Common patterns: HIGHNY (NYC high temp), HIGHCHI (Chicago), HIGHLA (LA)
+  series:
+    - "HIGHNY"    # New York City daily high temperature
+    - "HIGHCHI"   # Chicago daily high temperature
+
+  # Cities to pull NOAA forecasts for — must match keys in noaa_feed.CITY_GRID
+  cities:
+    - "new_york"
+    - "chicago"
+
+  loop_interval: 120          # Seconds between scans (2 minutes)
+  min_edge: 0.15              # Minimum NOAA prob - market ask to place a trade (15 cents)
+  min_time_to_expiry: 3600   # Only trade markets resolving > 1 hour from now
+  max_ask: 0.80              # Never buy YES above $0.80 (too expensive, slim upside)
+  max_contracts_per_signal: 1 # Start with 1 contract per signal ($10 budget)
+
 # ── Kalshi KXBTC15M Mean Reversion Bot ───────────────────────────────────────
 # Validate:  python mean_reversion_backtest.py
 # Paper:     python mean_reversion_main.py --paper
