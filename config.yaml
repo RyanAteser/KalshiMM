@@ -1,7 +1,9 @@
-# KalshiMM — Market Maker + Bonding Bot
-# Tune these before going live; run backtest.py --grid first.
+# KalshiMM — Sports Arbitrage Bot
+# Backtest:   python sports_main.py --backtest
+# Paper:      python sports_main.py --paper
+# Live:       python sports_main.py   (needs Kalshi creds in .env)
 
-paper_trade: false       # Set false to place real orders
+paper_trade: true        # Set false to place real orders
 log_level: "INFO"
 
 trading:
@@ -36,27 +38,28 @@ risk:
   max_loss_per_market: 50   # USD loss per market before pulling quotes
   daily_loss_limit: 200     # Total session loss limit in USD
 
-# ── Kalshi Weather Arbitrage Bot ─────────────────────────────────────────────
-# Run:   python weather_main.py --paper   (paper trade)
-#        python weather_main.py           (live, needs Kalshi creds in .env)
+# ── Kalshi Sports Arbitrage Bot ──────────────────────────────────────────────
+# Backtest (no API needed):  python sports_main.py --backtest
+# Paper trade:               python sports_main.py --paper
+# Live:                      python sports_main.py
 
-weather:
-  # Kalshi weather market series tickers — find these on kalshi.com/markets/weather
-  # Common patterns: HIGHNY (NYC high temp), HIGHCHI (Chicago), HIGHLA (LA)
+sports:
+  # Kalshi sports series tickers — find on kalshi.com/markets/sports
+  # e.g. NFLWINNER, NBAWINNER, MLBWINNER
   series:
-    - "HIGHNY"    # New York City daily high temperature
-    - "HIGHCHI"   # Chicago daily high temperature
+    - "NFLWINNER"
+    - "NBAWINNER"
 
-  # Cities to pull NOAA forecasts for — must match keys in noaa_feed.CITY_GRID
-  cities:
-    - "new_york"
-    - "chicago"
+  loop_interval: 30       # Seconds between price checks
 
-  loop_interval: 120          # Seconds between scans (2 minutes)
-  min_edge: 0.15              # Minimum NOAA prob - market ask to place a trade (15 cents)
-  min_time_to_expiry: 3600   # Only trade markets resolving > 1 hour from now
-  max_ask: 0.80              # Never buy YES above $0.80 (too expensive, slim upside)
-  max_contracts_per_signal: 1 # Start with 1 contract per signal ($10 budget)
+  # Bot parameters — "Balanced" preset from the simulator
+  C: 0.97                 # Combined ceiling: gate = C - avg(other side)
+  entry: 0.50             # Max ask to open from scratch
+  patience: 12            # Min ticks between balance-building buys
+  edge: 0.025             # Avg-down threshold (buy when px < avg - edge)
+  clip: 30                # Base clip size in shares
+  budget: 400.0           # Soft budget in USD; hard cap = budget × 3
+  max_imb: 300            # Max excess shares on one side (directional risk cap)
 
 # ── Kalshi KXBTC15M Mean Reversion Bot ───────────────────────────────────────
 # Validate:  python mean_reversion_backtest.py
